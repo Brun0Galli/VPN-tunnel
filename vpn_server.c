@@ -17,7 +17,8 @@
 
 // Envía un buffer cifrado: [4 bytes len][16 bytes nonce][ciphertext]
 int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len) {
-    uint8_t counter[AES_BLOCK_SIZE];
+    uint8_t nonce[AES_BLOCK_SIZE];
+    uint8_t ctr[AES_BLOCK_SIZE];
     uint8_t *cipher;
     uint32_t net_len;
     int n;
@@ -25,28 +26,34 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     cipher = malloc(len);
     if (!cipher) return -1;
 
-    // nonce/contador simple (en un proyecto real usa algo aleatorio + contador)
-    memset(counter, 0, AES_BLOCK_SIZE);
+    // ⚠️ Proyecto real: aquí deberías usar un nonce aleatorio + contador.
+    // Por ahora, todos ceros solo para probar funcionamiento.
+    memset(nonce, 0, AES_BLOCK_SIZE);
 
-    aes256_ctr_xor(ctx, counter, plain, cipher, len);
+    // Usamos una copia del nonce como contador interno
+    memcpy(ctr, nonce, AES_BLOCK_SIZE);
 
+    // Ciframos: AES-CTR(ctr, plaintext) → ciphertext
+    aes256_ctr_xor(ctx, ctr, plain, cipher, len);
+
+    // Enviamos: [len][nonce][ciphertext]
     net_len = htonl(len);
 
-    // enviar longitud
+    // longitud
     n = send(sock, &net_len, sizeof(net_len), 0);
     if (n != sizeof(net_len)) {
         free(cipher);
         return -1;
     }
 
-    // enviar nonce (16 bytes)
-    n = send(sock, counter, AES_BLOCK_SIZE, 0);
+    // nonce ORIGINAL (no el ctr modificado)
+    n = send(sock, nonce, AES_BLOCK_SIZE, 0);
     if (n != AES_BLOCK_SIZE) {
         free(cipher);
         return -1;
     }
 
-    // enviar ciphertext
+    // ciphertext
     n = send(sock, cipher, len, 0);
     if (n != (int)len) {
         free(cipher);
@@ -56,7 +63,6 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     free(cipher);
     return 0;
 }
-
 // Recibe [len][nonce][ciphertext] y devuelve plaintext
 int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len) {
     uint32_t net_len;
