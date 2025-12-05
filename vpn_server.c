@@ -14,8 +14,9 @@
 #include "common.h"
 
 #define MAX_PACKET_SIZE 2000
+#define MAX_CLIENTS 4
 
-// Envía un buffer cifrado: [4 bytes len][16 bytes nonce][ciphertext]
+// Enviar [len][nonce][ciphertext] a un cliente
 int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len) {
     uint8_t nonce[AES_BLOCK_SIZE];
     uint8_t ctr[AES_BLOCK_SIZE];
@@ -26,17 +27,12 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     cipher = malloc(len);
     if (!cipher) return -1;
 
-    // ⚠️ Proyecto real: aquí deberías usar un nonce aleatorio + contador.
-    // Por ahora, todos ceros solo para probar funcionamiento.
+    // ⚠️ Para demo usamos nonce = 0; en el proyecto final cámbialo por algo aleatorio único
     memset(nonce, 0, AES_BLOCK_SIZE);
-
-    // Usamos una copia del nonce como contador interno
     memcpy(ctr, nonce, AES_BLOCK_SIZE);
 
-    // Ciframos: AES-CTR(ctr, plaintext) → ciphertext
     aes256_ctr_xor(ctx, ctr, plain, cipher, len);
 
-    // Enviamos: [len][nonce][ciphertext]
     net_len = htonl(len);
 
     // longitud
@@ -46,7 +42,7 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
         return -1;
     }
 
-    // nonce ORIGINAL (no el ctr modificado)
+    // nonce original
     n = send(sock, nonce, AES_BLOCK_SIZE, 0);
     if (n != AES_BLOCK_SIZE) {
         free(cipher);
@@ -63,14 +59,14 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     free(cipher);
     return 0;
 }
-// Recibe [len][nonce][ciphertext] y devuelve plaintext
+
+// Recibir [len][nonce][ciphertext] y devolver plaintext
 int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len) {
     uint32_t net_len;
-    uint8_t counter[AES_BLOCK_SIZE];
+    uint8_t nonce[AES_BLOCK_SIZE];
     uint8_t *cipher;
     int n;
 
-    // recibir longitud
     n = recv(sock, &net_len, sizeof(net_len), MSG_WAITALL);
     if (n == 0) return 1; // conexión cerrada
     if (n != sizeof(net_len)) return -1;
@@ -78,22 +74,22 @@ int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len)
     uint32_t len = ntohl(net_len);
     if (len > MAX_PACKET_SIZE) return -1;
 
-    // recibir nonce
-    n = recv(sock, counter, AES_BLOCK_SIZE, MSG_WAITALL);
+    n = recv(sock, nonce, AES_BLOCK_SIZE, MSG_WAITALL);
     if (n != AES_BLOCK_SIZE) return -1;
 
     cipher = malloc(len);
     if (!cipher) return -1;
 
-    // recibir ciphertext
     n = recv(sock, cipher, len, MSG_WAITALL);
     if (n != (int)len) {
         free(cipher);
         return -1;
     }
 
-    // descifrar
-    aes256_ctr_xor(ctx, counter, cipher, plain, len);
+    // usar nonce como contador inicial
+    uint8_t ctr[AES_BLOCK_SIZE];
+    memcpy(ctr, nonce, AES_BLOCK_SIZE);
+    aes256_ctr_xor(ctx, ctr, cipher, plain, len);
     *out_len = len;
 
     free(cipher);
@@ -107,11 +103,9 @@ int main(void) {
         return 1;
     }
 
-    // AES con PSK
     aes256_ctx aes_ctx;
     aes256_init(&aes_ctx, VPN_PSK);
 
-    // Servidor TCP
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
@@ -132,33 +126,34 @@ int main(void) {
         return 1;
     }
 
-    if (listen(listen_fd, 1) < 0) {
+    if (listen(listen_fd, MAX_CLIENTS) < 0) {
         perror("listen");
         return 1;
     }
 
-    printf("[SERVER] Esperando cliente en puerto %d...\n", VPN_PORT);
+    printf("[SERVER] Escuchando en puerto %d...\n", VPN_PORT);
 
-    struct sockaddr_in cli_addr;
-    socklen_t cli_len = sizeof(cli_addr);
-    int client_fd = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
-    if (client_fd < 0) {
-        perror("accept");
-        return 1;
-    }
-
-    char ipstr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &cli_addr.sin_addr, ipstr, sizeof(ipstr));
-    printf("[SERVER] Cliente conectado desde %s\n", ipstr);
+    int clients[MAX_CLIENTS];
+    for (int i = 0; i < MAX_CLIENTS; i++) clients[i] = -1;
 
     uint8_t buf[MAX_PACKET_SIZE];
-    fd_set readfds;
-    int maxfd = (tun_fd > client_fd) ? tun_fd : client_fd;
 
     while (1) {
+        fd_set readfds;
         FD_ZERO(&readfds);
+
         FD_SET(tun_fd, &readfds);
-        FD_SET(client_fd, &readfds);
+        FD_SET(listen_fd, &readfds);
+
+        int maxfd = (tun_fd > listen_fd) ? tun_fd : listen_fd;
+
+        // añadir clientes al set
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i] >= 0) {
+                FD_SET(clients[i], &readfds);
+                if (clients[i] > maxfd) maxfd = clients[i];
+            }
+        }
 
         int ret = select(maxfd + 1, &readfds, NULL, NULL, NULL);
         if (ret < 0) {
@@ -166,42 +161,85 @@ int main(void) {
             break;
         }
 
-        // Datos desde tun0 → al cliente (cifrado)
+        // 1) Nuevo cliente
+        if (FD_ISSET(listen_fd, &readfds)) {
+            struct sockaddr_in cli_addr;
+            socklen_t cli_len = sizeof(cli_addr);
+            int new_fd = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
+            if (new_fd < 0) {
+                perror("accept");
+            } else {
+                char ipstr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &cli_addr.sin_addr, ipstr, sizeof(ipstr));
+                printf("[SERVER] Nuevo cliente desde %s\n", ipstr);
+
+                int placed = 0;
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (clients[i] < 0) {
+                        clients[i] = new_fd;
+                        placed = 1;
+                        break;
+                    }
+                }
+                if (!placed) {
+                    printf("[SERVER] Máximo de clientes alcanzado, cerrando nueva conexión\n");
+                    close(new_fd);
+                }
+            }
+        }
+
+        // 2) Paquetes desde tun0 → reenviar a TODOS los clientes
         if (FD_ISSET(tun_fd, &readfds)) {
             int n = read(tun_fd, buf, sizeof(buf));
             if (n < 0) {
                 perror("read tun");
                 break;
             }
-            // printf("[SERVER] Leído %d bytes de tun0\n", n);
-            if (send_encrypted(client_fd, &aes_ctx, buf, (uint32_t)n) < 0) {
-                fprintf(stderr, "[SERVER] Error enviando al cliente\n");
-                break;
+            // printf("[SERVER] Paquete %d bytes desde tun0\n", n);
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i] >= 0) {
+                    if (send_encrypted(clients[i], &aes_ctx, buf, (uint32_t)n) < 0) {
+                        printf("[SERVER] Error enviando a cliente %d, cerrando\n", i);
+                        close(clients[i]);
+                        clients[i] = -1;
+                    }
+                }
             }
         }
 
-        // Datos desde el cliente → tun0 (descifrado)
-        if (FD_ISSET(client_fd, &readfds)) {
-            uint32_t plain_len;
-            int r = recv_decrypted(client_fd, &aes_ctx, buf, &plain_len);
-            if (r == 1) {
-                printf("[SERVER] Cliente cerró la conexión\n");
-                break;
-            }
-            if (r < 0) {
-                fprintf(stderr, "[SERVER] Error recibiendo del cliente\n");
-                break;
-            }
-            // printf("[SERVER] Escribiendo %u bytes a tun0\n", plain_len);
-            int n = write(tun_fd, buf, plain_len);
-            if (n < 0) {
-                perror("write tun");
-                break;
+        // 3) Paquetes desde clientes → escribir en tun0
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int cfd = clients[i];
+            if (cfd >= 0 && FD_ISSET(cfd, &readfds)) {
+                uint32_t plain_len;
+                int r = recv_decrypted(cfd, &aes_ctx, buf, &plain_len);
+                if (r == 1) {
+                    printf("[SERVER] Cliente %d cerró conexión\n", i);
+                    close(cfd);
+                    clients[i] = -1;
+                    continue;
+                }
+                if (r < 0) {
+                    printf("[SERVER] Error recibiendo de cliente %d, cerrando\n", i);
+                    close(cfd);
+                    clients[i] = -1;
+                    continue;
+                }
+
+                int n = write(tun_fd, buf, plain_len);
+                if (n < 0) {
+                    perror("write tun");
+                    // aquí podrías decidir abortar todo
+                }
             }
         }
     }
 
-    close(client_fd);
+    // limpieza (por si acaso)
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] >= 0) close(clients[i]);
+    }
     close(listen_fd);
     close(tun_fd);
     return 0;
