@@ -3,6 +3,9 @@
 #define COMMON_H
 
 #include <stdint.h>
+#include "hmac.h"
+
+#define HMAC_TAG_SIZE HMAC_SHA256_TAG_SIZE
 
 #define VPN_PORT 5555        // Puerto TCP del túnel
 #define AES_256_KEY_SIZE 32

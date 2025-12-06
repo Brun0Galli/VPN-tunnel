@@ -12,6 +12,7 @@
 #include "tun.h"
 #include "aes.h"
 #include "common.h"
+#include "hmac.h"
 
 #define MAX_PACKET_SIZE 2000
 #define MAX_CLIENTS 4
@@ -21,28 +22,43 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     uint8_t nonce[AES_BLOCK_SIZE];
     uint8_t ctr[AES_BLOCK_SIZE];
     uint8_t *cipher;
+    uint8_t mac[HMAC_TAG_SIZE];
+    uint8_t *mac_input;
     uint32_t net_len;
     int n;
 
     cipher = malloc(len);
     if (!cipher) return -1;
 
-    // ⚠️ Para demo usamos nonce = 0; en el proyecto final cámbialo por algo aleatorio único
     memset(nonce, 0, AES_BLOCK_SIZE);
     memcpy(ctr, nonce, AES_BLOCK_SIZE);
 
     aes256_ctr_xor(ctx, ctr, plain, cipher, len);
 
+    mac_input = malloc(AES_BLOCK_SIZE + len);
+    if (!mac_input) {
+        free(cipher);
+        return -1;
+    }
+    memcpy(mac_input, nonce, AES_BLOCK_SIZE);
+    memcpy(mac_input + AES_BLOCK_SIZE, cipher, len);
+
+    hmac_sha256(VPN_PSK, AES_256_KEY_SIZE,
+                mac_input, AES_BLOCK_SIZE + len,
+                mac);
+
+    free(mac_input);
+
     net_len = htonl(len);
 
-    // longitud
+    // length
     n = send(sock, &net_len, sizeof(net_len), 0);
     if (n != sizeof(net_len)) {
         free(cipher);
         return -1;
     }
 
-    // nonce original
+    // nonce
     n = send(sock, nonce, AES_BLOCK_SIZE, 0);
     if (n != AES_BLOCK_SIZE) {
         free(cipher);
@@ -56,6 +72,13 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
         return -1;
     }
 
+    // mac
+    n = send(sock, mac, HMAC_TAG_SIZE, 0);
+    if (n != HMAC_TAG_SIZE) {
+        free(cipher);
+        return -1;
+    }
+
     free(cipher);
     return 0;
 }
@@ -64,9 +87,13 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
 int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len) {
     uint32_t net_len;
     uint8_t nonce[AES_BLOCK_SIZE];
+    uint8_t mac_recv[HMAC_TAG_SIZE];
+    uint8_t mac_calc[HMAC_TAG_SIZE];
     uint8_t *cipher;
+    uint8_t *mac_input;
     int n;
 
+    // leer longitud
     n = recv(sock, &net_len, sizeof(net_len), MSG_WAITALL);
     if (n == 0) return 1; // conexión cerrada
     if (n != sizeof(net_len)) return -1;
@@ -74,19 +101,48 @@ int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len)
     uint32_t len = ntohl(net_len);
     if (len > MAX_PACKET_SIZE) return -1;
 
+    // leer nonce
     n = recv(sock, nonce, AES_BLOCK_SIZE, MSG_WAITALL);
     if (n != AES_BLOCK_SIZE) return -1;
 
+    // leer ciphertext
     cipher = malloc(len);
     if (!cipher) return -1;
-
     n = recv(sock, cipher, len, MSG_WAITALL);
     if (n != (int)len) {
         free(cipher);
         return -1;
     }
 
-    // usar nonce como contador inicial
+    // leer MAC
+    n = recv(sock, mac_recv, HMAC_TAG_SIZE, MSG_WAITALL);
+    if (n != HMAC_TAG_SIZE) {
+        free(cipher);
+        return -1;
+    }
+
+    // recalcular HMAC
+    mac_input = malloc(AES_BLOCK_SIZE + len);
+    if (!mac_input) {
+        free(cipher);
+        return -1;
+    }
+    memcpy(mac_input, nonce, AES_BLOCK_SIZE);
+    memcpy(mac_input + AES_BLOCK_SIZE, cipher, len);
+
+    hmac_sha256(VPN_PSK, AES_256_KEY_SIZE,
+                mac_input, AES_BLOCK_SIZE + len,
+                mac_calc);
+
+    free(mac_input);
+
+    if (memcmp(mac_recv, mac_calc, HMAC_TAG_SIZE) != 0) {
+        fprintf(stderr, "[SERVER] MAC inválido: paquete corrupto o atacado\n");
+        free(cipher);
+        return -1;    // DESCARTAMOS EL PAQUETE
+    }
+
+    // MAC ok → descifrar
     uint8_t ctr[AES_BLOCK_SIZE];
     memcpy(ctr, nonce, AES_BLOCK_SIZE);
     aes256_ctr_xor(ctx, ctr, cipher, plain, len);

@@ -12,6 +12,7 @@
 #include "tun.h"
 #include "aes.h"
 #include "common.h"
+#include "hmac.h"
 
 #define MAX_PACKET_SIZE 2000
 
@@ -20,23 +21,37 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
     uint8_t nonce[AES_BLOCK_SIZE];
     uint8_t ctr[AES_BLOCK_SIZE];
     uint8_t *cipher;
+    uint8_t mac[HMAC_TAG_SIZE];
+    uint8_t *mac_input;
     uint32_t net_len;
     int n;
 
     cipher = malloc(len);
     if (!cipher) return -1;
 
-    // ⚠️ Proyecto real: aquí deberías usar un nonce aleatorio + contador.
-    // Por ahora, todos ceros solo para probar funcionamiento.
+    // ⚠️ Demo: nonce en cero. En proyecto final: usar random.
     memset(nonce, 0, AES_BLOCK_SIZE);
-
-    // Usamos una copia del nonce como contador interno
     memcpy(ctr, nonce, AES_BLOCK_SIZE);
 
-    // Ciframos: AES-CTR(ctr, plaintext) → ciphertext
+    // Cifrar plaintext → ciphertext
     aes256_ctr_xor(ctx, ctr, plain, cipher, len);
 
-    // Enviamos: [len][nonce][ciphertext]
+    // MAC sobre (nonce || ciphertext)
+    mac_input = malloc(AES_BLOCK_SIZE + len);
+    if (!mac_input) {
+        free(cipher);
+        return -1;
+    }
+    memcpy(mac_input, nonce, AES_BLOCK_SIZE);
+    memcpy(mac_input + AES_BLOCK_SIZE, cipher, len);
+
+    hmac_sha256(VPN_PSK, AES_256_KEY_SIZE,
+                mac_input, AES_BLOCK_SIZE + len,
+                mac);
+
+    free(mac_input);
+
+    // Enviamos: [len][nonce][ciphertext][mac]
     net_len = htonl(len);
 
     // longitud
@@ -46,7 +61,7 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
         return -1;
     }
 
-    // nonce ORIGINAL (no el ctr modificado)
+    // nonce
     n = send(sock, nonce, AES_BLOCK_SIZE, 0);
     if (n != AES_BLOCK_SIZE) {
         free(cipher);
@@ -60,16 +75,27 @@ int send_encrypted(int sock, aes256_ctx *ctx, const uint8_t *plain, uint32_t len
         return -1;
     }
 
+    // mac
+    n = send(sock, mac, HMAC_TAG_SIZE, 0);
+    if (n != HMAC_TAG_SIZE) {
+        free(cipher);
+        return -1;
+    }
+
     free(cipher);
     return 0;
 }
 
 int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len) {
     uint32_t net_len;
-    uint8_t counter[AES_BLOCK_SIZE];
+    uint8_t nonce[AES_BLOCK_SIZE];
+    uint8_t mac_recv[HMAC_TAG_SIZE];
+    uint8_t mac_calc[HMAC_TAG_SIZE];
     uint8_t *cipher;
+    uint8_t *mac_input;
     int n;
 
+    // leer longitud
     n = recv(sock, &net_len, sizeof(net_len), MSG_WAITALL);
     if (n == 0) return 1; // cerrado
     if (n != sizeof(net_len)) return -1;
@@ -77,19 +103,52 @@ int recv_decrypted(int sock, aes256_ctx *ctx, uint8_t *plain, uint32_t *out_len)
     uint32_t len = ntohl(net_len);
     if (len > MAX_PACKET_SIZE) return -1;
 
-    n = recv(sock, counter, AES_BLOCK_SIZE, MSG_WAITALL);
+    // leer nonce
+    n = recv(sock, nonce, AES_BLOCK_SIZE, MSG_WAITALL);
     if (n != AES_BLOCK_SIZE) return -1;
 
+    // leer ciphertext
     cipher = malloc(len);
     if (!cipher) return -1;
-
     n = recv(sock, cipher, len, MSG_WAITALL);
     if (n != (int)len) {
         free(cipher);
         return -1;
     }
 
-    aes256_ctr_xor(ctx, counter, cipher, plain, len);
+    // leer MAC
+    n = recv(sock, mac_recv, HMAC_TAG_SIZE, MSG_WAITALL);
+    if (n != HMAC_TAG_SIZE) {
+        free(cipher);
+        return -1;
+    }
+
+    // recalcular HMAC(counter=nonce, ciphertext)
+    mac_input = malloc(AES_BLOCK_SIZE + len);
+    if (!mac_input) {
+        free(cipher);
+        return -1;
+    }
+    memcpy(mac_input, nonce, AES_BLOCK_SIZE);
+    memcpy(mac_input + AES_BLOCK_SIZE, cipher, len);
+
+    hmac_sha256(VPN_PSK, AES_256_KEY_SIZE,
+                mac_input, AES_BLOCK_SIZE + len,
+                mac_calc);
+
+    free(mac_input);
+
+    // comparar MAC
+    if (memcmp(mac_recv, mac_calc, HMAC_TAG_SIZE) != 0) {
+        fprintf(stderr, "[CLIENT] MAC inválido: paquete corrupto o atacado\n");
+        free(cipher);
+        return -1; // descartamos el paquete
+    }
+
+    // MAC válido → descifrar
+    uint8_t ctr[AES_BLOCK_SIZE];
+    memcpy(ctr, nonce, AES_BLOCK_SIZE);
+    aes256_ctr_xor(ctx, ctr, cipher, plain, len);
     *out_len = len;
 
     free(cipher);
